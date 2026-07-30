@@ -33,9 +33,19 @@ export async function captureScreenshot({ region, filename, method } = {}) {
   let clip = undefined;
 
   if (region === 'chart') {
+    // Fixed 2026-07-30: TradingView renders 3 elements sharing
+    // data-name="pane-canvas" (price/volume/RSI panes) — querySelector
+    // (singular) always returned only the first (price pane alone), so
+    // this crop silently dropped the price axis and every other pane.
+    // chart-markup-table is the container for the whole pane stack
+    // (all panes + axes), still excluding the toolbar/watchlist sidebar —
+    // verified directly: 1421x841 vs. the old 1351x474 price-pane-only
+    // crop, see notes/tv_capture_investigation_2026-07-30.md in the
+    // TVSCOUT project for the before/after comparison images.
     const bounds = await evaluate(`
       (function() {
-        var el = document.querySelector('[data-name="pane-canvas"]')
+        var el = document.querySelector('[class*="chart-markup-table"]')
+          || document.querySelector('[data-name="pane-canvas"]')
           || document.querySelector('[class*="chart-container"]')
           || document.querySelector('canvas');
         if (!el) return null;

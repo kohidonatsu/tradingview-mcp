@@ -118,46 +118,78 @@ export async function layoutList() {
 }
 
 export async function layoutSwitch({ name }) {
+  // Two bugs fixed here (2026-07-30), both confirmed via direct testing
+  // against TradingView Desktop's own internal API before this fix:
+  //
+  // 1. `TradingViewApi.loadChartFromServer` is `async` — decompiled source:
+  //    `async loadChartFromServer(e){await(this._loadChartService?.loadChart(e,!1))}`.
+  //    The old code called it WITHOUT awaiting and resolved success
+  //    immediately after, so this function always reported success before
+  //    the load had even started, let alone finished or failed.
+  //
+  // 2. `loadChart(e,...)`'s decompiled source reads `e.url` directly
+  //    (`` `/chart/${e.url}/` ``) and passes the same `e` on to
+  //    `backend.loadLayout(e)` — it needs the FULL saved-chart object
+  //    (as returned by `getSavedCharts`), not a bare id/url string. The old
+  //    code extracted `match.id || match.chartId` and passed that bare
+  //    value, which breaks the internal fetch (confirmed: awaiting it
+  //    properly with a bare id/url string rejects with an unhelpful bare
+  //    `Response` error). Passing the whole matched object fixes it.
+  //
+  // The load can also show a real "unsaved changes?" confirmation dialog
+  // (`_chartWidgetCollection.hasChanges()`), which the awaited promise
+  // will not resolve past until dismissed — so the dialog must be polled
+  // for and dismissed WHILE the load promise is still pending, not as a
+  // separate step afterward (that only worked before by accident, since
+  // the un-awaited call meant this function had already returned by the
+  // time any dialog appeared).
   const escaped = JSON.stringify(name);
   const result = await evaluateAsync(`
     new Promise(function(resolve) {
       try {
         var target = ${escaped};
-        if (/^\\d+$/.test(target)) { window.TradingViewApi.loadChartFromServer(target); resolve({success: true, method: 'loadChartFromServer', id: target, source: 'internal_api'}); return; }
         window.TradingViewApi.getSavedCharts(function(charts) {
           if (!charts || !Array.isArray(charts)) { resolve({success: false, error: 'getSavedCharts returned no data', source: 'internal_api'}); return; }
           var match = null;
-          for (var i = 0; i < charts.length; i++) { var cname = charts[i].name || charts[i].title || ''; if (cname === target || cname.toLowerCase() === target.toLowerCase()) { match = charts[i]; break; } }
+          if (/^\\d+$/.test(target)) { for (var n = 0; n < charts.length; n++) { if (String(charts[n].id) === target) { match = charts[n]; break; } } }
+          if (!match) { for (var i = 0; i < charts.length; i++) { var cname = charts[i].name || charts[i].title || ''; if (cname === target || cname.toLowerCase() === target.toLowerCase()) { match = charts[i]; break; } } }
           if (!match) { for (var j = 0; j < charts.length; j++) { var cn = (charts[j].name || charts[j].title || '').toLowerCase(); if (cn.indexOf(target.toLowerCase()) !== -1) { match = charts[j]; break; } } }
           if (!match) { resolve({success: false, error: 'Layout "' + target + '" not found.', source: 'internal_api'}); return; }
-          var chartId = match.id || match.chartId;
-          window.TradingViewApi.loadChartFromServer(chartId);
-          resolve({success: true, method: 'loadChartFromServer', id: chartId, name: match.name || match.title, source: 'internal_api'});
+
+          var dismissed = false;
+          var dismissTimer = setInterval(function() {
+            var btns = document.querySelectorAll('button');
+            for (var b = 0; b < btns.length; b++) {
+              var text = btns[b].textContent.trim();
+              if (/open anyway|don't save|discard/i.test(text)) { btns[b].click(); dismissed = true; clearInterval(dismissTimer); break; }
+            }
+          }, 200);
+
+          window.TradingViewApi.loadChartFromServer(match)
+            .then(function() {
+              clearInterval(dismissTimer);
+              resolve({ success: true, id: match.id, url: match.url, name: match.name || match.title, source: 'internal_api', unsaved_dialog_dismissed: dismissed });
+            })
+            .catch(function(e) {
+              clearInterval(dismissTimer);
+              resolve({ success: false, error: String((e && e.message) || e), source: 'internal_api' });
+            });
         });
-        setTimeout(function() { resolve({success: false, error: 'getSavedCharts timed out', source: 'internal_api'}); }, 5000);
+        setTimeout(function() { resolve({success: false, error: 'getSavedCharts/load timed out', source: 'internal_api'}); }, 10000);
       } catch(e) { resolve({success: false, error: e.message, source: 'internal_api'}); }
     })
   `);
   if (!result?.success) throw new Error(result?.error || 'Unknown error switching layout');
 
-  // Handle "unsaved changes" confirmation dialog
-  await new Promise(r => setTimeout(r, 500));
-  const dismissed = await evaluate(`
-    (function() {
-      var btns = document.querySelectorAll('button');
-      for (var i = 0; i < btns.length; i++) {
-        var text = btns[i].textContent.trim();
-        if (/open anyway|don't save|discard/i.test(text)) {
-          btns[i].click();
-          return true;
-        }
-      }
-      return false;
-    })()
-  `);
-
-  if (dismissed) await new Promise(r => setTimeout(r, 1000));
-  return { success: true, layout: result.name || name, layout_id: result.id, source: result.source, action: 'switched', unsaved_dialog_dismissed: dismissed };
+  return {
+    success: true,
+    layout: result.name || name,
+    layout_id: result.id,
+    layout_url: result.url,
+    source: result.source,
+    action: 'switched',
+    unsaved_dialog_dismissed: result.unsaved_dialog_dismissed,
+  };
 }
 
 export async function keyboard({ key, modifiers }) {

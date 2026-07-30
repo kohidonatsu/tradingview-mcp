@@ -1,5 +1,6 @@
 node_modules/
 screenshots/
+state_recovery/
 scripts/current.pine
 temp_*
 *.log

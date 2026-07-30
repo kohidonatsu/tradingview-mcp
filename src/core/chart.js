@@ -115,7 +115,14 @@ export async function manageIndicator({ action, indicator, entity_id, inputs: in
   }
 }
 
-export async function getVisibleRange() {
+export async function getVisibleRange({ _deps } = {}) {
+  // Fixed 2026-07-30: called a bare `evaluate(...)` that was never
+  // imported into this scope (every other function in this file resolves
+  // it via _resolve(_deps)/_evaluate) — this always threw "evaluate is
+  // not defined" instead of returning the visible range. The write path
+  // (setVisibleRange, below) already resolved it correctly and was
+  // unaffected.
+  const { evaluate } = _resolve(_deps);
   const result = await evaluate(`
     (function() {
       var chart = ${CHART_API};
