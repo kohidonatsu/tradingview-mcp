@@ -17,6 +17,7 @@
  * it's pointed at, including the user's own primary layout.
  */
 import { evaluate, disconnect } from '../connection.js';
+import { waitForChartReady } from '../wait.js';
 import * as chartCore from './chart.js';
 import * as dataCore from './data.js';
 import * as captureCore from './capture.js';
@@ -41,6 +42,9 @@ async function readPriceScale() {
       var chart = window.TradingViewApi._activeChartWidgetWV.value();
       var ps = chart._chartWidget.model().mainSeries().priceScale();
       var pr = ps.priceRange();
+      if (!pr) {
+        throw new Error('priceScale().priceRange() is null — chart is still loading; call waitForChartReady() first');
+      }
       window.__tvscoutPriceRangeCtor = pr.constructor;
       return { isAutoScale: ps.isAutoScale(), min: pr.minValue(), max: pr.maxValue() };
     })()
@@ -100,6 +104,26 @@ function inputsArrayToObject(inputs) {
   return Object.keys(obj).length > 0 ? obj : undefined;
 }
 
+// ── Chart-grid guard ────────────────────────────────────────────────────
+
+/**
+ * The capture region crop (core/capture.js, region=chart) selects the
+ * FIRST DOM element matching a chart-pane class — correct only when the
+ * current layout is a single chart. If the layout is actually a multi-chart
+ * grid (found 2026-07-30: TVScout's own saved layout can end up in this
+ * state — 3 chart widgets, ids 1/2/4, all showing the same symbol at
+ * different resolutions), that crop silently grabs whichever pane happens
+ * to be first in DOM order, which can be much smaller than the full chart
+ * area, producing a squashed, unusable screenshot with no error at all.
+ * Check chart-widget count up front and fail loudly instead.
+ */
+async function countChartWidgets() {
+  const result = await evaluate(
+    `Object.keys(window.TradingViewApi._chartWidgetCollection.chartsSymbols()).length`
+  );
+  return typeof result === 'number' ? result : null;
+}
+
 // ── Full state snapshot ─────────────────────────────────────────────────
 
 /**
@@ -139,7 +163,7 @@ export async function readFullState() {
  * already been changed — not a stale empty bookkeeping object.
  */
 async function applyCaptureState(originalState, opts, bookkeeping) {
-  const { symbol, timeframe, monthsBack, addIndicatorNames, removeIndicatorNames } = opts;
+  const { symbol, timeframe, monthsBack, addIndicatorNames, removeIndicatorNames, addIndicatorInputs = {} } = opts;
 
   if (symbol) {
     const normalize = (s) => String(s).replace(/^[A-Z]+:/, '').toUpperCase();
@@ -168,6 +192,15 @@ async function applyCaptureState(originalState, opts, bookkeeping) {
     );
     const newIds = (after || []).filter((id) => !(before || []).includes(id));
     bookkeeping.added.push(...newIds);
+
+    // createStudy's own inputs argument does NOT apply overrides at creation
+    // time (see the identical note in revertState below) — apply requested
+    // input overrides via a separate setInputs() call against the new
+    // entity, same as the existing re-add-after-revert workaround.
+    const overrides = addIndicatorInputs[indicatorName];
+    if (overrides && newIds.length > 0) {
+      await indicatorsCore.setInputs({ entity_id: newIds[0], inputs: overrides });
+    }
   }
 
   const now = Math.floor(Date.now() / 1000);
@@ -279,6 +312,7 @@ export async function captureIsolated({
   monthsBack = 6,
   addIndicatorNames = ['Visible Range Volume Profile'],
   removeIndicatorNames = ['Relative Strength Index'],
+  addIndicatorInputs = {},
   region = 'chart',
   filename,
 } = {}) {
@@ -290,10 +324,36 @@ export async function captureIsolated({
   const bookkeeping = { added: [], removed: [] };
 
   try {
+    const chartWidgetCount = await countChartWidgets();
+    if (chartWidgetCount !== null && chartWidgetCount > 1) {
+      return {
+        success: false,
+        capture: {
+          success: false,
+          error: `layout has ${chartWidgetCount} chart panes, expected 1 — the ` +
+            `region=chart crop would grab the wrong (possibly tiny) pane. Fix the ` +
+            `layout to a single chart before capturing.`,
+        },
+        revert_errors: [],
+        recovery_file: null,
+        original_state: null,
+        after_state: null,
+      };
+    }
+
+    // A layout switch to a just-recreated/rarely-used chart (e.g. TVScout
+    // right after closing extra panes, found 2026-08-01) can leave the
+    // widget's model mid-load for a few seconds: priceScale().priceRange()
+    // returns null until data finishes loading, which crashes readFullState
+    // (readPriceScale dereferences it unconditionally). Reuse the existing
+    // wait-for-render poll (already used after setSymbol/setTimeframe in
+    // chart.js) so readFullState never runs against a still-loading chart.
+    await waitForChartReady();
+
     originalState = await readFullState();
 
     try {
-      await applyCaptureState(originalState, { symbol, timeframe, monthsBack, addIndicatorNames, removeIndicatorNames }, bookkeeping);
+      await applyCaptureState(originalState, { symbol, timeframe, monthsBack, addIndicatorNames, removeIndicatorNames, addIndicatorInputs }, bookkeeping);
       captureResult = await captureCore.captureScreenshot({ region, filename });
     } finally {
       // Runs even if applyCaptureState or captureScreenshot threw —
