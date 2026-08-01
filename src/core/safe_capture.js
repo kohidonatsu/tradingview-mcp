@@ -17,7 +17,6 @@
  * it's pointed at, including the user's own primary layout.
  */
 import { evaluate, disconnect } from '../connection.js';
-import { waitForChartReady } from '../wait.js';
 import * as chartCore from './chart.js';
 import * as dataCore from './data.js';
 import * as captureCore from './capture.js';
@@ -32,6 +31,36 @@ const RECOVERY_DIR = join(dirname(dirname(__dirname)), 'state_recovery');
 // ── Price scale (not exposed as a chart.js function — priceScale() lives
 //    a few levels deeper than anything chart.js already reaches) ──────────
 
+/**
+ * Poll directly for the exact signal that distinguishes a chart that has
+ * genuinely finished loading price data from one that merely isn't showing
+ * a loading spinner (found 2026-08-01: wait.js's waitForChartReady — a DOM
+ * heuristic checking for a loading spinner + stable [class*="bar"] element
+ * count — reported "ready" while priceScale().priceRange() was still null
+ * and the resulting screenshot was blank; a manual 8s sleep-then-check
+ * confirmed priceRange() eventually becomes non-null once real data has
+ * loaded, so poll that directly instead of trusting the DOM heuristic).
+ */
+async function waitForPriceRangeReady(timeoutMs = 15000, pollMs = 300) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const ready = await evaluate(`
+      (function() {
+        try {
+          var chart = window.TradingViewApi._activeChartWidgetWV.value();
+          var pr = chart._chartWidget.model().mainSeries().priceScale().priceRange();
+          return !!pr;
+        } catch (e) {
+          return false;
+        }
+      })()
+    `);
+    if (ready) return true;
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+  return false; // caller decides whether to proceed anyway or surface a clear error
+}
+
 async function readPriceScale() {
   // Stashes the live PriceRange instance's own constructor on a page
   // global so restorePriceScale can build a new instance later that
@@ -43,7 +72,7 @@ async function readPriceScale() {
       var ps = chart._chartWidget.model().mainSeries().priceScale();
       var pr = ps.priceRange();
       if (!pr) {
-        throw new Error('priceScale().priceRange() is null — chart is still loading; call waitForChartReady() first');
+        throw new Error('priceScale().priceRange() is null — chart is still loading; call waitForPriceRangeReady() first');
       }
       window.__tvscoutPriceRangeCtor = pr.constructor;
       return { isAutoScale: ps.isAutoScale(), min: pr.minValue(), max: pr.maxValue() };
@@ -163,7 +192,7 @@ export async function readFullState() {
  * already been changed — not a stale empty bookkeeping object.
  */
 async function applyCaptureState(originalState, opts, bookkeeping) {
-  const { symbol, timeframe, monthsBack, addIndicatorNames, removeIndicatorNames, addIndicatorInputs = {} } = opts;
+  const { symbol, timeframe, monthsBack, fromTime, toTime, addIndicatorNames, removeIndicatorNames, addIndicatorInputs = {} } = opts;
 
   if (symbol) {
     const normalize = (s) => String(s).replace(/^[A-Z]+:/, '').toUpperCase();
@@ -203,12 +232,28 @@ async function applyCaptureState(originalState, opts, bookkeeping) {
     }
   }
 
-  const now = Math.floor(Date.now() / 1000);
-  const from = now - Math.round(monthsBack * 30.4 * 86400);
-  await chartCore.setVisibleRange({ from, to: now });
+  // An explicit [fromTime, toTime] window (epoch seconds) takes precedence
+  // over monthsBack — used for a tight capture around a specific structure
+  // (e.g. RC's n1->n3 swing) rather than "N months back from now".
+  let from, to;
+  if (fromTime != null && toTime != null) {
+    from = fromTime;
+    to = toTime;
+  } else {
+    to = Math.floor(Date.now() / 1000);
+    from = to - Math.round(monthsBack * 30.4 * 86400);
+  }
+  await chartCore.setVisibleRange({ from, to });
 
   await resetScaleAutoFit();
-  await new Promise((r) => setTimeout(r, 1200)); // let the re-render settle before capture
+  // The symbol/indicator/range changes above can each briefly invalidate
+  // the price series before it re-renders with real data — poll for the
+  // same concrete signal used before readFullState (see
+  // waitForPriceRangeReady) rather than a blind sleep, which was found
+  // 2026-08-01 to sometimes fire before candles had actually drawn,
+  // producing a blank (but "successful") screenshot.
+  await waitForPriceRangeReady();
+  await new Promise((r) => setTimeout(r, 300)); // small settle margin after data is confirmed ready
 }
 
 /**
@@ -310,6 +355,8 @@ export async function captureIsolated({
   symbol,
   timeframe = 'D',
   monthsBack = 6,
+  fromTime,
+  toTime,
   addIndicatorNames = ['Visible Range Volume Profile'],
   removeIndicatorNames = ['Relative Strength Index'],
   addIndicatorInputs = {},
@@ -345,15 +392,17 @@ export async function captureIsolated({
     // right after closing extra panes, found 2026-08-01) can leave the
     // widget's model mid-load for a few seconds: priceScale().priceRange()
     // returns null until data finishes loading, which crashes readFullState
-    // (readPriceScale dereferences it unconditionally). Reuse the existing
-    // wait-for-render poll (already used after setSymbol/setTimeframe in
-    // chart.js) so readFullState never runs against a still-loading chart.
-    await waitForChartReady();
+    // (readPriceScale dereferences it unconditionally). waitForChartReady()
+    // (wait.js's DOM-heuristic poll) was tried first here and found
+    // insufficient — it reported "ready" while priceRange() was still null
+    // and produced a blank screenshot; waitForPriceRangeReady() polls the
+    // exact signal directly instead.
+    await waitForPriceRangeReady();
 
     originalState = await readFullState();
 
     try {
-      await applyCaptureState(originalState, { symbol, timeframe, monthsBack, addIndicatorNames, removeIndicatorNames, addIndicatorInputs }, bookkeeping);
+      await applyCaptureState(originalState, { symbol, timeframe, monthsBack, fromTime, toTime, addIndicatorNames, removeIndicatorNames, addIndicatorInputs }, bookkeeping);
       captureResult = await captureCore.captureScreenshot({ region, filename });
     } finally {
       // Runs even if applyCaptureState or captureScreenshot threw —
